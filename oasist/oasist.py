@@ -23,6 +23,7 @@ import re
 import shutil
 import tempfile
 import sys
+import importlib.util
 from pathlib import Path
 from typing import Optional, Dict, Any, Protocol, Generator, List
 from dataclasses import dataclass, field
@@ -189,6 +190,14 @@ class VersioningConfig:
     enabled: bool = False
     auto_detect: bool = False
     base_version: Optional[str] = None
+    generation_mode: Optional[str] = "full"  # "full" or "changed"
+    
+    def __post_init__(self):
+        """Validate generation_mode."""
+        if self.generation_mode and self.generation_mode.lower() not in ("full", "changed"):
+            raise ValueError(f"generation_mode must be 'full' or 'changed', got '{self.generation_mode}'")
+        if self.generation_mode:
+            self.generation_mode = self.generation_mode.lower()
 
 @dataclass
 class VersionConfig:
@@ -492,6 +501,178 @@ class SchemaProcessor:
         return schema
 
 # ============================================================================
+# SCHEMA COMPARATOR
+# ============================================================================
+class SchemaComparator:
+    """Compares OpenAPI schemas to detect changes between versions."""
+    
+    @staticmethod
+    def get_endpoint_signature(path: str, method: str) -> str:
+        """Create consistent endpoint signature.
+        
+        Args:
+            path: API path (e.g., "/api/user/{id}")
+            method: HTTP method (e.g., "get", "post")
+            
+        Returns:
+            Endpoint signature string (e.g., "GET /api/user/{id}")
+        """
+        return f"{method.upper()} {path}"
+    
+    @staticmethod
+    def normalize_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize schema for comparison by removing metadata and sorting keys.
+        
+        Args:
+            schema: Schema dictionary to normalize
+            
+        Returns:
+            Normalized schema dictionary
+        """
+        if not isinstance(schema, dict):
+            return schema
+        
+        # Create a copy to avoid modifying original
+        normalized = {}
+        
+        # Sort keys for consistent comparison
+        for key in sorted(schema.keys()):
+            value = schema[key]
+            
+            # Skip metadata fields that don't affect functionality
+            if key in ('description', 'summary', 'example', 'examples', 'externalDocs'):
+                continue
+            
+            # Recursively normalize nested structures
+            if isinstance(value, dict):
+                normalized[key] = SchemaComparator.normalize_schema(value)
+            elif isinstance(value, list):
+                normalized[key] = [
+                    SchemaComparator.normalize_schema(item) if isinstance(item, dict) else item
+                    for item in value
+                ]
+            else:
+                normalized[key] = value
+        
+        return normalized
+    
+    @staticmethod
+    def compare_operation(base_op: Dict[str, Any], new_op: Dict[str, Any]) -> bool:
+        """Compare two operation objects to see if they're identical.
+        
+        Args:
+            base_op: Base operation object
+            new_op: New operation object
+            
+        Returns:
+            True if operations are identical, False otherwise
+        """
+        base_norm = SchemaComparator.normalize_schema(base_op)
+        new_norm = SchemaComparator.normalize_schema(new_op)
+        return base_norm == new_norm
+    
+    @staticmethod
+    def compare_endpoints(base_schema: Dict[str, Any], new_schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Compare endpoints between two schemas.
+        
+        Args:
+            base_schema: Base version schema
+            new_schema: New version schema
+            
+        Returns:
+            Dictionary with keys: 'new', 'modified', 'unchanged', 'removed'
+            Each contains a list of endpoint signatures
+        """
+        result = {
+            'new': [],
+            'modified': [],
+            'unchanged': [],
+            'removed': []
+        }
+        
+        base_paths = base_schema.get('paths', {})
+        new_paths = new_schema.get('paths', {})
+        
+        # Extract all endpoints from both schemas
+        base_endpoints = {}
+        new_endpoints = {}
+        
+        for path, path_item in base_paths.items():
+            if isinstance(path_item, dict):
+                for method in SchemaProcessor.HTTP_METHODS:
+                    if method in path_item:
+                        signature = SchemaComparator.get_endpoint_signature(path, method)
+                        base_endpoints[signature] = path_item[method]
+        
+        for path, path_item in new_paths.items():
+            if isinstance(path_item, dict):
+                for method in SchemaProcessor.HTTP_METHODS:
+                    if method in path_item:
+                        signature = SchemaComparator.get_endpoint_signature(path, method)
+                        new_endpoints[signature] = path_item[method]
+        
+        # Compare endpoints
+        all_endpoints = set(base_endpoints.keys()) | set(new_endpoints.keys())
+        
+        for signature in all_endpoints:
+            if signature in new_endpoints and signature not in base_endpoints:
+                result['new'].append(signature)
+            elif signature in base_endpoints and signature not in new_endpoints:
+                result['removed'].append(signature)
+            elif signature in base_endpoints and signature in new_endpoints:
+                # Compare operations
+                if SchemaComparator.compare_operation(base_endpoints[signature], new_endpoints[signature]):
+                    result['unchanged'].append(signature)
+                else:
+                    result['modified'].append(signature)
+        
+        return result
+    
+    @staticmethod
+    def compare_models(base_schema: Dict[str, Any], new_schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Compare models/schemas between two schemas.
+        
+        Args:
+            base_schema: Base version schema
+            new_schema: New version schema
+            
+        Returns:
+            Dictionary with keys: 'new', 'modified', 'unchanged'
+            Each contains a list of model names
+        """
+        result = {
+            'new': [],
+            'modified': [],
+            'unchanged': []
+        }
+        
+        base_schemas = base_schema.get('components', {}).get('schemas', {})
+        new_schemas = new_schema.get('components', {}).get('schemas', {})
+        
+        if not isinstance(base_schemas, dict):
+            base_schemas = {}
+        if not isinstance(new_schemas, dict):
+            new_schemas = {}
+        
+        # Compare all models
+        all_models = set(base_schemas.keys()) | set(new_schemas.keys())
+        
+        for model_name in all_models:
+            if model_name in new_schemas and model_name not in base_schemas:
+                result['new'].append(model_name)
+            elif model_name in base_schemas and model_name in new_schemas:
+                # Compare schema structures
+                base_norm = SchemaComparator.normalize_schema(base_schemas[model_name])
+                new_norm = SchemaComparator.normalize_schema(new_schemas[model_name])
+                
+                if base_norm == new_norm:
+                    result['unchanged'].append(model_name)
+                else:
+                    result['modified'].append(model_name)
+        
+        return result
+
+# ============================================================================
 # VERSION DETECTOR
 # ============================================================================
 class VersionDetector:
@@ -600,25 +781,144 @@ class CodeFormatter:
             logger.info("To enable formatting, install Black: pip install black")
             return True  # Not an error, just skip formatting
         
+        # Count Python files first
+        python_files = list(directory.rglob("*.py"))
+        total_files = len(python_files)
+        
+        if total_files == 0:
+            logger.info("No Python files found to format")
+            return True
+        
+        logger.info(f"Formatting {total_files} Python file(s) with Black...")
+        
         try:
-            with console.status("[accent]Formatting code with Black...", spinner="dots"):
-                result = subprocess.run(
-                    ['black', '--quiet', str(directory)],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
+            # Use Progress bar to show formatting progress
+            # Helper function to truncate and format file names with fixed width
+            def format_file_name(file_path: str, prefix: str = "Reformatting") -> str:
+                """Format file name with fixed width for stable progress bar."""
+                file_name = Path(file_path).name if file_path else "Starting..."
+                # Fixed display width for the entire description to keep bar stable
+                # This is the actual visible width (markup codes don't count)
+                display_width = 50
+                prefix_text = f"{prefix}: "
+                prefix_display_len = len(prefix_text)  # Actual display length
+                available_width = display_width - prefix_display_len
+                
+                # Truncate filename if needed
+                if len(file_name) > available_width:
+                    file_name = file_name[:available_width-3] + "..."
+                
+                # Pad filename to ensure consistent total display width
+                # The padding is in the actual displayed text, not including markup
+                padded_name = file_name.ljust(available_width)
+                return f"[accent]{prefix_text}[/accent]{padded_name}"
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}", style="dim"),
+                BarColumn(bar_width=None),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("({task.completed}/{task.total} files)"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=False
+            ) as progress:
+                task = progress.add_task(
+                    format_file_name("", "Formatting"),
+                    total=total_files
                 )
                 
-                if result.returncode == 0:
-                    logger.info("✓ Code formatted successfully with Black")
+                # Run Black without --quiet to capture output
+                process = subprocess.Popen(
+                    ['black', str(directory)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                
+                processed_files = 0
+                reformatted_files = []
+                
+                # Parse output line by line
+                for line in process.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Black outputs lines like:
+                    # - "reformatted /path/to/file.py"
+                    # - "would reformat /path/to/file.py" (in check mode)
+                    # - "All done! ✨ 🍰 ✨"
+                    # - "X files reformatted, Y files left unchanged."
+                    if line.startswith("reformatted "):
+                        file_path = line.replace("reformatted ", "").strip()
+                        reformatted_files.append(file_path)
+                        processed_files += 1
+                        progress.update(
+                            task,
+                            advance=1,
+                            description=format_file_name(file_path, "Reformatting")
+                        )
+                        logger.debug(f"Reformatted: {file_path}")
+                    elif line.startswith("would reformat "):
+                        file_path = line.replace("would reformat ", "").strip()
+                        processed_files += 1
+                        progress.update(
+                            task,
+                            advance=1,
+                            description=format_file_name(file_path, "Would reformat")
+                        )
+                    elif "files reformatted" in line or "files left unchanged" in line:
+                        # Summary line - extract numbers to update progress
+                        logger.info(f"Black: {line}")
+                        # Parse summary like "X files reformatted, Y files left unchanged."
+                        reformatted_match = re.search(r'(\d+)\s+files?\s+reformatted', line)
+                        unchanged_match = re.search(r'(\d+)\s+files?\s+left\s+unchanged', line)
+                        
+                        total_reformatted = 0
+                        total_unchanged = 0
+                        if reformatted_match:
+                            total_reformatted = int(reformatted_match.group(1))
+                        if unchanged_match:
+                            total_unchanged = int(unchanged_match.group(1))
+                        
+                        # Update progress to reflect all processed files from summary
+                        total_processed = total_reformatted + total_unchanged
+                        if total_processed > 0 and total_processed <= total_files:
+                            progress.update(task, completed=total_processed)
+                    elif "All done!" in line:
+                        # Completion message
+                        logger.debug(line)
+                    elif line and not line.startswith("Using configuration"):
+                        # Other output (errors, warnings, etc.)
+                        if "error" in line.lower() or "warning" in line.lower():
+                            logger.warning(f"Black: {line}")
+                        else:
+                            logger.debug(f"Black: {line}")
+                
+                # Wait for process to complete
+                returncode = process.wait(timeout=300)
+                
+                # Update progress to 100% if not already there
+                if processed_files < total_files:
+                    progress.update(task, completed=total_files)
+                
+                if returncode == 0:
+                    if reformatted_files:
+                        logger.info(f"✓ Code formatted successfully: {len(reformatted_files)} file(s) reformatted")
+                    else:
+                        logger.info("✓ Code formatting complete: All files already formatted")
                     return True
                 else:
-                    error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                    logger.warning(f"Black formatting completed with warnings: {error_msg}")
-                    return True  # Still consider success if files were formatted
+                    logger.warning(f"Black formatting completed with exit code {returncode}")
+                    if processed_files > 0:
+                        logger.info(f"Processed {processed_files} file(s)")
+                    return True  # Still consider success if files were processed
                     
         except subprocess.TimeoutExpired:
-            logger.error("Black formatting timeout after 60s")
+            logger.error("Black formatting timeout after 300s")
             return False
         except Exception as e:
             logger.error(f"Black formatting failed: {e}")
@@ -743,6 +1043,132 @@ class VersionRegistry:
         """
         data = VersionRegistry.load(registry_path)
         return data.get("metadata", {}).get("latest_version")
+    
+    @staticmethod
+    def get_base_version(registry_path: Path) -> Optional[str]:
+        """Get base version from registry.
+        
+        Args:
+            registry_path: Path to version_registry.json file
+            
+        Returns:
+            Base version string, or None if not set
+        """
+        data = VersionRegistry.load(registry_path)
+        return data.get("metadata", {}).get("base_version")
+    
+    @staticmethod
+    def get_base_schema_path(registry_path: Path, version: str) -> Optional[Path]:
+        """Get path to base version's schema file if cached.
+        
+        Args:
+            registry_path: Path to version_registry.json file
+            version: Version string to get base schema for
+            
+        Returns:
+            Path to cached schema file, or None if not cached
+        """
+        data = VersionRegistry.load(registry_path)
+        version_data = data.get("versions", {}).get(version, {})
+        base_version = version_data.get("base_version")
+        
+        if not base_version:
+            return None
+        
+        # Check if base version has cached schema
+        base_version_data = data.get("versions", {}).get(base_version, {})
+        schema_url = base_version_data.get("schema_url")
+        
+        if not schema_url:
+            return None
+        
+        # For file paths, return the path directly
+        if not schema_url.startswith(('http://', 'https://')):
+            schema_path = Path(schema_url)
+            if not schema_path.is_absolute():
+                schema_path = Path.cwd() / schema_path
+            if schema_path.exists():
+                return schema_path
+        
+        # For URLs, we'd need to fetch, so return None
+        return None
+    
+    @staticmethod
+    def save_version_schema(registry_path: Path, version: str, schema: Dict[str, Any]) -> None:
+        """Save schema to cache file for later use.
+        
+        Args:
+            registry_path: Path to version_registry.json file
+            version: Version string
+            schema: Schema dictionary to save
+        """
+        try:
+            # Create cache directory next to registry
+            cache_dir = registry_path.parent / ".schema_cache"
+            cache_dir.mkdir(exist_ok=True)
+            
+            # Save schema as JSON
+            version_dir = VersionDetector.normalize_for_directory(version)
+            cache_file = cache_dir / f"{version_dir}.json"
+            
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(schema, f, indent=2)
+            
+            logger.debug(f"Cached schema for version {version} at {cache_file}")
+        except Exception as e:
+            logger.warning(f"Failed to cache schema for version {version}: {e}")
+    
+    @staticmethod
+    def load_version_schema(registry_path: Path, version: str) -> Optional[Dict[str, Any]]:
+        """Load schema for a specific version from cache or registry.
+        
+        Args:
+            registry_path: Path to version_registry.json file
+            version: Version string to load schema for
+            
+        Returns:
+            Schema dictionary, or None if not available
+        """
+        # First try to load from cache
+        cache_dir = registry_path.parent / ".schema_cache"
+        version_dir = VersionDetector.normalize_for_directory(version)
+        cache_file = cache_dir / f"{version_dir}.json"
+        
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.debug(f"Failed to load cached schema from {cache_file}: {e}")
+        
+        # Fallback: try to load from original schema_url if it's a local file
+        data = VersionRegistry.load(registry_path)
+        version_data = data.get("versions", {}).get(version, {})
+        schema_url = version_data.get("schema_url")
+        
+        if not schema_url:
+            return None
+        
+        # Try to load from original file path
+        if not schema_url.startswith(('http://', 'https://')):
+            schema_path = Path(schema_url)
+            if not schema_path.is_absolute():
+                schema_path = Path.cwd() / schema_path
+            if schema_path.exists():
+                try:
+                    with open(schema_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    # Try JSON first, then YAML
+                    try:
+                        return json.loads(content)
+                    except json.JSONDecodeError:
+                        return yaml.safe_load(content)
+                except Exception as e:
+                    logger.debug(f"Failed to load schema from {schema_path}: {e}")
+        
+        # If not cached or file doesn't exist, return None
+        # The caller should handle fetching with the original config
+        return None
 
 # ============================================================================
 # CLIENT GENERATOR
@@ -1094,17 +1520,21 @@ class ClientGenerator:
                 continue
             
             # Generate client for this version
-            if self._generate_versioned_client(service_key, version_str, version_config, version_output_path, force):
-                success_count += 1
-                
-                # Update registry
-                schema_url = version_config.input.get('target', '')
+            # Fetch schema for registry update
+            schema_url = version_config.input.get('target', '')
+            schema = None
+            if schema_url:
                 schema = SchemaProcessor.fetch(
                     schema_url,
                     version_config.input.get('params', {}) or {},
                     version_config.input.get('prefer_json', False),
                     version_config.input.get('headers', {}) or {}
                 )
+            
+            if self._generate_versioned_client(service_key, version_str, version_config, version_output_path, force, config, registry_path):
+                success_count += 1
+                
+                # Update registry
                 if schema:
                     openapi_version = schema.get('openapi') or schema.get('swagger', 'unknown')
                     # Extract endpoint signatures (simplified - just method + path)
@@ -1116,6 +1546,40 @@ class ClientGenerator:
                                 if method in path_item:
                                     endpoints.append(f"{method.upper()} {path}")
                     
+                    # Extract model names
+                    models = []
+                    components = schema.get('components', {})
+                    schemas = components.get('schemas', {})
+                    if isinstance(schemas, dict):
+                        models = list(schemas.keys())
+                    
+                    # Determine changed endpoints/models if using incremental generation
+                    changed_endpoints = []
+                    changed_models = []
+                    base_version = config.versioning.base_version if config.versioning else None
+                    generation_mode = config.versioning.generation_mode if config.versioning else "full"
+                    
+                    if generation_mode == "changed" and base_version and version_str != base_version:
+                        # Load base schema for comparison
+                        base_schema = VersionRegistry.load_version_schema(registry_path, base_version)
+                        if not base_schema:
+                            base_version_config = config.versions.get(base_version)
+                            if base_version_config:
+                                base_schema_url = base_version_config.input.get('target', '')
+                                if base_schema_url:
+                                    base_schema = SchemaProcessor.fetch(
+                                        base_schema_url,
+                                        base_version_config.input.get('params', {}) or {},
+                                        base_version_config.input.get('prefer_json', False),
+                                        base_version_config.input.get('headers', {}) or {}
+                                    )
+                        
+                        if base_schema:
+                            endpoint_changes = SchemaComparator.compare_endpoints(base_schema, schema)
+                            model_changes = SchemaComparator.compare_models(base_schema, schema)
+                            changed_endpoints = endpoint_changes['new'] + endpoint_changes['modified']
+                            changed_models = model_changes['new'] + model_changes['modified']
+                    
                     VersionRegistry.add_version(
                         registry_path,
                         version_str,
@@ -1123,7 +1587,11 @@ class ClientGenerator:
                             "openapi_version": str(openapi_version),
                             "schema_url": schema_url,
                             "endpoints": endpoints,
-                            "endpoint_count": len(endpoints)
+                            "endpoint_count": len(endpoints),
+                            "models": models,
+                            "changed_endpoints": changed_endpoints,
+                            "changed_models": changed_models,
+                            "base_version": base_version if version_str != base_version else None
                         }
                     )
         
@@ -1141,7 +1609,7 @@ class ClientGenerator:
             return False
     
     def _generate_versioned_client(self, service_key: str, version: str, version_config: VersionConfig, 
-                                   output_path: Path, force: bool) -> bool:
+                                   output_path: Path, force: bool, config: ServiceConfig, registry_path: Path) -> bool:
         """Generate client for a specific version.
         
         Args:
@@ -1150,6 +1618,8 @@ class ClientGenerator:
             version_config: Version configuration
             output_path: Output directory for this version
             force: If True, regenerate even if exists
+            config: Service configuration (for accessing versioning config)
+            registry_path: Path to version registry
             
         Returns:
             True if generation succeeded, False otherwise
@@ -1170,15 +1640,130 @@ class ClientGenerator:
             return False
         schema = SchemaProcessor.sanitize_security(schema)
         
+        # Check generation mode
+        generation_mode = config.versioning.generation_mode if config.versioning else "full"
+        base_version = config.versioning.base_version if config.versioning else None
+        
+        # Determine if this is the base version
+        is_base_version = (base_version and version == base_version) or (
+            not base_version and version == VersionRegistry.get_base_version(registry_path)
+        )
+        
+        # Use incremental generation if mode is "changed" and not base version
+        if generation_mode == "changed" and not is_base_version and base_version:
+            logger.info(f"Using incremental generation for version '{version}' (base: '{base_version}')")
+            return self._generate_incremental_client(
+                service_key, version, version_config, output_path, force,
+                schema, base_version, config, registry_path
+            )
+        else:
+            # Use full generation
+            if generation_mode == "changed" and is_base_version:
+                logger.info(f"Base version '{version}' always uses full generation mode (ignoring 'changed' mode)")
+            
+            # Clean output directory
+            if output_path.exists():
+                shutil.rmtree(output_path)
+            
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            # Generate client
+            is_json = version_config.input.get('prefer_json', False) or schema_url.lower().endswith('.json')
+            with temp_file(schema, as_json=is_json) as schema_path:
+                success = GeneratorRunner.run(schema_path, output_path, version_config.output.get('disable_post_hooks', True))
+            
+            if not success:
+                if output_path.exists() and output_path.is_dir() and not any(output_path.iterdir()):
+                    output_path.rmdir()
+                return False
+            
+            # Format generated code with Black if enabled
+            if version_config.output.get('format_with_black', True):
+                CodeFormatter.format_directory(output_path)
+            
+            # Save schema to cache if this is the base version (for incremental generation)
+            if is_base_version:
+                VersionRegistry.save_version_schema(registry_path, version, schema)
+            
+            logger.info(f"Generated version '{version}' → {output_path}")
+            return True
+    
+    def _generate_incremental_client(self, service_key: str, version: str, version_config: VersionConfig,
+                                     output_path: Path, force: bool, new_schema: Dict[str, Any],
+                                     base_version: str, config: ServiceConfig, registry_path: Path) -> bool:
+        """Generate incremental client with only changed endpoints/models.
+        
+        Args:
+            service_key: Service identifier
+            version: Version string
+            version_config: Version configuration
+            output_path: Output directory for this version
+            force: If True, regenerate even if exists
+            new_schema: New version schema
+            base_version: Base version string
+            config: Service configuration
+            registry_path: Path to version registry
+            
+        Returns:
+            True if generation succeeded, False otherwise
+        """
+        # Load base version schema
+        base_schema = VersionRegistry.load_version_schema(registry_path, base_version)
+        
+        if not base_schema:
+            # Try to fetch base version schema from config
+            base_version_config = config.versions.get(base_version)
+            if base_version_config:
+                base_schema_url = base_version_config.input.get('target', '')
+                if base_schema_url:
+                    base_schema = SchemaProcessor.fetch(
+                        base_schema_url,
+                        base_version_config.input.get('params', {}) or {},
+                        base_version_config.input.get('prefer_json', False),
+                        base_version_config.input.get('headers', {}) or {}
+                    )
+                    if base_schema:
+                        base_schema = SchemaProcessor.sanitize_security(base_schema)
+        
+        if not base_schema:
+            logger.warning(f"Could not load base version '{base_version}' schema, falling back to full generation")
+            # Fallback to full generation
+            if output_path.exists():
+                shutil.rmtree(output_path)
+            output_path.mkdir(parents=True, exist_ok=True)
+            is_json = version_config.input.get('prefer_json', False) or version_config.input.get('target', '').lower().endswith('.json')
+            with temp_file(new_schema, as_json=is_json) as schema_path:
+                success = GeneratorRunner.run(schema_path, output_path, version_config.output.get('disable_post_hooks', True))
+            if success and version_config.output.get('format_with_black', True):
+                CodeFormatter.format_directory(output_path)
+            return success
+        
+        # Compare schemas to detect changes
+        endpoint_changes = SchemaComparator.compare_endpoints(base_schema, new_schema)
+        model_changes = SchemaComparator.compare_models(base_schema, new_schema)
+        
+        # Log change detection results
+        logger.info(f"Change detection for version '{version}':")
+        logger.info(f"  Endpoints - New: {len(endpoint_changes['new'])}, Modified: {len(endpoint_changes['modified'])}, "
+                   f"Unchanged: {len(endpoint_changes['unchanged'])}, Removed: {len(endpoint_changes['removed'])}")
+        logger.info(f"  Models - New: {len(model_changes['new'])}, Modified: {len(model_changes['modified'])}, "
+                   f"Unchanged: {len(model_changes['unchanged'])}")
+        
+        # Filter schema to include only changed endpoints/models and dependencies
+        filtered_schema = self._filter_schema_for_changes(
+            new_schema, endpoint_changes, model_changes, base_schema
+        )
+        
         # Clean output directory
         if output_path.exists():
             shutil.rmtree(output_path)
         
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # Generate client
+        # Generate client with filtered schema
+        schema_url = version_config.input.get('target', '')
         is_json = version_config.input.get('prefer_json', False) or schema_url.lower().endswith('.json')
-        with temp_file(schema, as_json=is_json) as schema_path:
+        with temp_file(filtered_schema, as_json=is_json) as schema_path:
             success = GeneratorRunner.run(schema_path, output_path, version_config.output.get('disable_post_hooks', True))
         
         if not success:
@@ -1186,12 +1771,247 @@ class ClientGenerator:
                 output_path.rmdir()
             return False
         
+        # Generate import stubs for unchanged endpoints/models
+        self._generate_import_stubs(
+            output_path, base_version, endpoint_changes, model_changes
+        )
+        
         # Format generated code with Black if enabled
         if version_config.output.get('format_with_black', True):
             CodeFormatter.format_directory(output_path)
         
-        logger.info(f"Generated version '{version}' → {output_path}")
+        logger.info(f"Generated incremental version '{version}' → {output_path}")
         return True
+    
+    def _filter_schema_for_changes(self, new_schema: Dict[str, Any], endpoint_changes: Dict[str, Any],
+                                   model_changes: Dict[str, Any], base_schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Filter schema to include only changed endpoints/models and their dependencies.
+        
+        Args:
+            new_schema: Full new version schema
+            endpoint_changes: Change detection results for endpoints
+            model_changes: Change detection results for models
+            base_schema: Base version schema for dependency resolution
+            
+        Returns:
+            Filtered schema dictionary
+        """
+        filtered = {
+            'openapi': new_schema.get('openapi', '3.0.0'),
+            'info': new_schema.get('info', {}),
+            'servers': new_schema.get('servers', []),
+            'paths': {},
+            'components': {
+                'schemas': {},
+                'parameters': new_schema.get('components', {}).get('parameters', {}),
+                'responses': new_schema.get('components', {}).get('responses', {}),
+                'securitySchemes': new_schema.get('components', {}).get('securitySchemes', {})
+            }
+        }
+        
+        # Get changed endpoint signatures
+        changed_endpoints = set(endpoint_changes['new'] + endpoint_changes['modified'])
+        
+        # Filter paths to include only changed endpoints
+        new_paths = new_schema.get('paths', {})
+        for path, path_item in new_paths.items():
+            if not isinstance(path_item, dict):
+                continue
+            
+            filtered_path_item = {}
+            for method in SchemaProcessor.HTTP_METHODS:
+                if method in path_item:
+                    signature = SchemaComparator.get_endpoint_signature(path, method)
+                    if signature in changed_endpoints:
+                        filtered_path_item[method] = path_item[method]
+            
+            # Include path if it has any changed endpoints
+            if filtered_path_item:
+                # Preserve path-level parameters and other properties
+                filtered_path_item.update({
+                    k: v for k, v in path_item.items()
+                    if k not in SchemaProcessor.HTTP_METHODS
+                })
+                filtered['paths'][path] = filtered_path_item
+        
+        # Collect all model references from changed endpoints
+        referenced_models = set()
+        for path, path_item in filtered['paths'].items():
+            for method, operation in path_item.items():
+                if method not in SchemaProcessor.HTTP_METHODS:
+                    continue
+                if not isinstance(operation, dict):
+                    continue
+                
+                # Extract schema references from request body
+                request_body = operation.get('requestBody', {})
+                if isinstance(request_body, dict):
+                    content = request_body.get('content', {})
+                    for content_type, media_type in content.items():
+                        if isinstance(media_type, dict):
+                            schema_ref = media_type.get('schema', {})
+                            referenced_models.update(self._extract_schema_refs(schema_ref))
+                
+                # Extract schema references from responses
+                responses = operation.get('responses', {})
+                for status, response in responses.items():
+                    if isinstance(response, dict):
+                        content = response.get('content', {})
+                        for content_type, media_type in content.items():
+                            if isinstance(media_type, dict):
+                                schema_ref = media_type.get('schema', {})
+                                referenced_models.update(self._extract_schema_refs(schema_ref))
+                
+                # Extract schema references from parameters
+                parameters = operation.get('parameters', [])
+                for param in parameters:
+                    if isinstance(param, dict):
+                        schema_ref = param.get('schema', {})
+                        referenced_models.update(self._extract_schema_refs(schema_ref))
+        
+        # Include changed models and all referenced models
+        changed_models = set(model_changes['new'] + model_changes['modified'])
+        models_to_include = changed_models | referenced_models
+        
+        # Filter components.schemas
+        new_schemas = new_schema.get('components', {}).get('schemas', {})
+        if isinstance(new_schemas, dict):
+            for model_name, model_schema in new_schemas.items():
+                if model_name in models_to_include:
+                    filtered['components']['schemas'][model_name] = model_schema
+        
+        return filtered
+    
+    def _extract_schema_refs(self, schema: Dict[str, Any]) -> set:
+        """Extract all schema references from a schema object.
+        
+        Args:
+            schema: Schema dictionary
+            
+        Returns:
+            Set of schema reference names (without #/components/schemas/ prefix)
+        """
+        refs = set()
+        
+        if not isinstance(schema, dict):
+            return refs
+        
+        # Check for direct $ref
+        ref = schema.get('$ref', '')
+        if ref and ref.startswith('#/components/schemas/'):
+            model_name = ref.replace('#/components/schemas/', '')
+            refs.add(model_name)
+        
+        # Check for allOf, anyOf, oneOf
+        for key in ['allOf', 'anyOf', 'oneOf']:
+            if key in schema and isinstance(schema[key], list):
+                for item in schema[key]:
+                    if isinstance(item, dict):
+                        refs.update(self._extract_schema_refs(item))
+        
+        # Check for items (arrays)
+        if 'items' in schema and isinstance(schema['items'], dict):
+            refs.update(self._extract_schema_refs(schema['items']))
+        
+        # Check for properties (objects)
+        if 'properties' in schema and isinstance(schema['properties'], dict):
+            for prop_schema in schema['properties'].values():
+                if isinstance(prop_schema, dict):
+                    refs.update(self._extract_schema_refs(prop_schema))
+        
+        # Check for additionalProperties
+        if 'additionalProperties' in schema:
+            if isinstance(schema['additionalProperties'], dict):
+                refs.update(self._extract_schema_refs(schema['additionalProperties']))
+        
+        return refs
+    
+    def _generate_import_stubs(self, output_path: Path, base_version: str,
+                               endpoint_changes: Dict[str, Any], model_changes: Dict[str, Any]) -> None:
+        """Generate import stubs for unchanged endpoints/models from base version.
+        
+        Args:
+            output_path: Output directory for this version
+            base_version: Base version string
+            endpoint_changes: Change detection results for endpoints
+            model_changes: Change detection results for models
+        """
+        base_version_import = VersionDetector.normalize_for_import(base_version)
+        
+        # Group unchanged endpoints by module
+        unchanged_endpoints = endpoint_changes.get('unchanged', [])
+        endpoint_modules = {}
+        
+        for endpoint_sig in unchanged_endpoints:
+            # Parse endpoint signature: "METHOD /api/module/endpoint"
+            parts = endpoint_sig.split(' ', 1)
+            if len(parts) != 2:
+                continue
+            path = parts[1]
+            
+            # Extract module name from path (e.g., /api/user -> user)
+            path_parts = [p for p in path.split('/') if p and p != 'api']
+            if path_parts:
+                module_name = path_parts[0]
+                if module_name not in endpoint_modules:
+                    endpoint_modules[module_name] = []
+                endpoint_modules[module_name].append(endpoint_sig)
+        
+        # Generate __init__.py files for unchanged endpoint modules
+        # Only create stubs in directories that already exist (from changed endpoints)
+        # This keeps the structure clean - we don't create empty directories
+        api_dir = output_path / 'api'
+        if api_dir.exists():
+            for module_name, endpoints in endpoint_modules.items():
+                module_dir = api_dir / module_name
+                # Only create import stub if directory already exists (has changed endpoints)
+                if module_dir.exists():
+                    init_file = module_dir / '__init__.py'
+                    import_line = f"from ...{base_version_import}.api.{module_name} import *\n"
+                    
+                    # Append import if file exists, otherwise create
+                    if init_file.exists():
+                        with open(init_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        if import_line.strip() not in content:
+                            with open(init_file, 'a', encoding='utf-8') as f:
+                                # Add newline if file doesn't end with one
+                                if content and not content.endswith('\n'):
+                                    f.write('\n')
+                                f.write(import_line)
+                    else:
+                        with open(init_file, 'w', encoding='utf-8') as f:
+                            f.write(import_line)
+        
+        # Generate imports for unchanged models
+        unchanged_models = model_changes.get('unchanged', [])
+        if unchanged_models:
+            models_dir = output_path / 'models'
+            if models_dir.exists():
+                init_file = models_dir / '__init__.py'
+                
+                # Create import statement
+                if len(unchanged_models) > 10:
+                    # Use * import if too many models
+                    import_line = f"from ...{base_version_import}.models import *\n"
+                else:
+                    # Import specific models
+                    model_names = ', '.join(unchanged_models)
+                    import_line = f"from ...{base_version_import}.models import {model_names}\n"
+                
+                # Append import if file exists, otherwise create
+                if init_file.exists():
+                    with open(init_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    if import_line.strip() not in content:
+                        with open(init_file, 'a', encoding='utf-8') as f:
+                            # Add newline if file doesn't end with one
+                            if content and not content.endswith('\n'):
+                                f.write('\n')
+                            f.write(import_line)
+                else:
+                    with open(init_file, 'w', encoding='utf-8') as f:
+                        f.write(import_line)
     
     def _generate_versioned_entry_point(self, service_key: str, config: ServiceConfig, base_output_path: Path) -> None:
         """Generate __init__.py with version selector and factory function.
@@ -1207,31 +2027,40 @@ class ClientGenerator:
         if not versions:
             return
         
-        # Generate imports and version map
-        imports = []
-        version_map_entries = []
-        client_names = []
+        # Generate version map using importlib for dynamic imports
+        # (Python can't import from directories starting with numbers)
+        version_dir_map = []
         
         for version_str in versions:
-            version_import = VersionDetector.normalize_for_import(version_str)
-            client_name = f"{version_import.upper()}Client"
-            
-            # Import the AuthenticatedClient from this version
-            imports.append(f"from .{version_import}.client import AuthenticatedClient as {client_name}")
-            version_map_entries.append(f'        "{version_str}": {client_name},')
-            client_names.append(f'"{client_name}"')
+            version_dir = VersionDetector.normalize_for_directory(version_str)
+            version_dir_map.append(f'    "{version_str}": "{version_dir}",')
         
         # Get latest version for default
         latest_version = VersionRegistry.get_latest_version(registry_path) or versions[-1]
         
-        # Generate __init__.py content
+        # Get base_url from version configs if available
+        default_base_url = config.base_url
+        if not default_base_url and versions:
+            # Try to get base_url from first version config
+            first_version = versions[0]
+            if first_version in config.versions:
+                default_base_url = config.versions[first_version].output.get('base_url', '')
+        
+        # Generate __init__.py content using importlib for dynamic imports
         init_content = f'''"""Generated API client for {service_key}.
 
 This module provides versioned clients for the {config.name} API.
 Use get_client() to obtain a client instance for a specific version.
 """
 
-{chr(10).join(imports)}
+import importlib
+import sys
+from pathlib import Path
+
+# Version to directory mapping
+_VERSION_DIRS = {{
+{chr(10).join(version_dir_map)}
+}}
 
 def get_client(version: str = "{latest_version}", base_url: str = None, **kwargs):
     """Get client for specific version.
@@ -1246,24 +2075,48 @@ def get_client(version: str = "{latest_version}", base_url: str = None, **kwargs
         
     Raises:
         ValueError: If version is not found
+        ImportError: If the version module cannot be imported
     """
-    version_map = {{
-{chr(10).join(version_map_entries)}
-    }}
-    
-    client_class = version_map.get(version)
-    if not client_class:
-        available_versions = ", ".join(version_map.keys())
+    if version not in _VERSION_DIRS:
+        available_versions = ", ".join(_VERSION_DIRS.keys())
         raise ValueError(f"Version {{version}} not found. Available versions: {{available_versions}}")
     
+    # Get the directory name for this version
+    version_dir = _VERSION_DIRS[version]
+    
+    # Dynamically import the client module using importlib
+    # Since directory names may start with numbers, we need to use the full path
+    current_module = sys.modules[__name__]
+    package_path = Path(current_module.__file__).parent
+    version_module_path = package_path / version_dir / "client.py"
+    
+    if not version_module_path.exists():
+        raise ImportError(f"Client module not found for version {{version}} at {{version_module_path}}")
+    
+    # Use importlib to load the module
+    spec = importlib.util.spec_from_file_location(
+        f"{{__name__}}.{{version_dir}}.client",
+        version_module_path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load client module for version {{version}}")
+    
+    client_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client_module)
+    
+    # Get the AuthenticatedClient class
+    client_class = getattr(client_module, "AuthenticatedClient", None)
+    if client_class is None:
+        raise ImportError(f"AuthenticatedClient not found in module for version {{version}}")
+    
+    # Use base_url from config if not provided
     if base_url is None:
-        # Use base_url from config if available
-        base_url = "{config.base_url}" if "{config.base_url}" else None
+        base_url = "{default_base_url}" if "{default_base_url}" else None
     
     return client_class(base_url=base_url, **kwargs)
 
 
-__all__ = ["get_client", {", ".join(client_names)}]
+__all__ = ["get_client"]
 '''
         
         # Write __init__.py
@@ -1482,10 +2335,23 @@ class ConfigLoader:
             if versioning_enabled:
                 # Load versioned project
                 try:
+                    generation_mode = versioning_cfg.get('generation_mode', 'full')
+                    # Validate generation_mode
+                    if generation_mode and generation_mode.lower() not in ("full", "changed"):
+                        logger.warning(f"Invalid generation_mode '{generation_mode}' for project '{key}', using 'full'")
+                        generation_mode = "full"
+                    else:
+                        generation_mode = generation_mode.lower() if generation_mode else "full"
+                    
+                    base_version = versioning_cfg.get('base_version')
+                    # Note: Base version will be forced to full mode during generation,
+                    # but we keep the generation_mode as "changed" for non-base versions
+                    
                     versioning = VersioningConfig(
                         enabled=True,
                         auto_detect=bool(versioning_cfg.get('auto_detect', False)),
-                        base_version=versioning_cfg.get('base_version')
+                        base_version=base_version,
+                        generation_mode=generation_mode
                     )
                     
                     # Load version-specific configs
