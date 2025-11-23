@@ -17,4 +17,4 @@ __all__ = [
 
 from .oasist import ClientGenerator, ServiceConfig, CodeFormatter  # re-export for convenience
 
-__version__ = "1.1.1"
+__version__ = "1.2.1"

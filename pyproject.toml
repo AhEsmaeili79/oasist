@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oasist"
-version = "1.1.1"
+version = "1.2.1"
 description = "OASist Client Generator: generate Python clients from OpenAPI schemas with auto-formatting, custom headers and environment variables"
 readme = "README.md"
 requires-python = ">=3.8"
