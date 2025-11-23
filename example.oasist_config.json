@@ -1,7 +1,91 @@
 {
-  "output_dir": "./test",
+  "output_dir": "./clients",
   "projects": {
+    "api_service": {
+      "_comment": "Example: Versioned project with incremental generation (only changed endpoints/models)",
+      "versioning": {
+        "enabled": true,
+        "auto_detect": true,
+        "base_version": "1.0.0",
+        "generation_mode": "changed"
+      },
+      "versions": {
+        "1.0.0": {
+          "_comment": "Base version - always generates full client regardless of generation_mode",
+          "input": {
+            "target": "https://api.example.com/v1/openapi.json",
+            "prefer_json": true
+          },
+          "output": {
+            "base_url": "https://api.example.com/v1",
+            "package_name": "api_service",
+            "format_with_black": true
+          }
+        },
+        "1.1.0": {
+          "_comment": "Incremental version - only generates changed endpoints/models, imports rest from base",
+          "input": {
+            "target": "https://api.example.com/v1.1/openapi.json",
+            "prefer_json": true
+          },
+          "output": {
+            "base_url": "https://api.example.com/v1.1",
+            "package_name": "api_service",
+            "format_with_black": true
+          }
+        },
+        "2.0.0": {
+          "_comment": "Using local file for schema (useful for offline or cached schemas)",
+          "input": {
+            "target": "./schemas/api_service_v2.0.0.json",
+            "prefer_json": true
+          },
+          "output": {
+            "base_url": "https://api.example.com/v2",
+            "package_name": "api_service",
+            "format_with_black": true
+          }
+        }
+      }
+    },
+    "payment_gateway": {
+      "_comment": "Example: Versioned project with full generation mode (each version is complete)",
+      "versioning": {
+        "enabled": true,
+        "auto_detect": false,
+        "base_version": "v1",
+        "generation_mode": "full"
+      },
+      "versions": {
+        "v1": {
+          "input": {
+            "target": "https://payments.example.com/api/v1/openapi.yaml",
+            "prefer_json": false
+          },
+          "output": {
+            "base_url": "https://payments.example.com/api/v1",
+            "package_name": "payment_gateway",
+            "format_with_black": true
+          }
+        },
+        "v2": {
+          "input": {
+            "target": "${PAYMENT_V2_SCHEMA_URL}",
+            "prefer_json": true,
+            "headers": {
+              "Authorization": "Bearer ${PAYMENT_API_TOKEN}"
+            }
+          },
+          "output": {
+            "base_url": "${PAYMENT_V2_BASE_URL}",
+            "package_name": "payment_gateway",
+            "format_with_black": true
+          }
+        }
+      }
+    },
     "user_service": {
+      "_comment": "Example: Non-versioned project (traditional single version)",
       "input": {
         "target": "http://localhost:8001/openapi.json",
         "prefer_json": true
@@ -15,9 +99,10 @@
       }
     },
     "test": {
+      "_comment": "Example: Non-versioned project with environment variables and custom headers",
       "input": {
         "target": "${TEST_SCHEMA_URL}",
-        "prefer_json": true, 
+        "prefer_json": true,
         "_comment": "Optional headers for the schema fetch request",
         "headers": {
           "Authorization": "Bearer ${API_TOKEN}",
@@ -30,10 +115,11 @@
         "base_url": "${TEST_BASE_URL}",
         "package_name": "test",
         "format_with_black": true,
-        "_comment": "Set format_with_black to false to disable automatic code formatting do not put the directory in .gitignore if you want to effect of clean code generation"
+        "_comment": "Set format_with_black to false to disable automatic code formatting. Do not put the directory in .gitignore if you want the effect of clean code generation"
       }
     },
     "local_yaml": {
+      "_comment": "Example: Non-versioned project using YAML schema",
       "input": {
         "target": "http://localhost:8004/api/schema/"
       },
@@ -47,4 +133,3 @@
     }
   }
 }
-

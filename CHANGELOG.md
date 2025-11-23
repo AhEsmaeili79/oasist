@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.2.1] - 2024-11-24
+## [1.2.1] - 2025-11-24
 
 ### Added
 - **API Versioning Support** - Generate and manage multiple API versions simultaneously
@@ -105,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   5. Create import stubs for unchanged code
   6. Update version registry with change information
 
-## [1.1.1] - 2024-10-16
+## [1.1.1] - 2025-10-16
 
 ### Added
 - **Custom headers support** - `request_headers` field for authenticated schema endpoints
@@ -142,7 +142,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSON decode errors now show line and column numbers
 - Import organization and removed inline import
 
-## [1.0.0] - 2024-10-16
+## [1.0.0] - 2025-10-16
 
 ### Added
 - Complete production-ready release
